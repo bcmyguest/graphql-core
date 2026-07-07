@@ -1494,6 +1494,36 @@ def describe_validate_overlapping_fields_can_be_merged():
                 schema=schema_with_keywords,
             )
 
+    def does_not_take_quadratic_time_for_many_repeated_fields():
+        repeated_fields = "name " * 3000
+        assert_valid(
+            f"""
+            fragment manyRepeatedFields on Dog {{
+              {repeated_fields}
+            }}
+            """
+        )
+
+    def finds_conflicts_even_among_many_repeated_fields():
+        repeated_fields = "name " * 100
+        assert_errors(
+            f"""
+            fragment conflictsAmongMany on Dog {{
+              {repeated_fields}
+              name: nickname
+            }}
+            """,
+            [
+                {
+                    "message": "Fields 'name' conflict"
+                    " because 'name' and 'nickname' are different fields."
+                    " Use different aliases on the fields"
+                    " to fetch both if this was intentional.",
+                    "locations": [(3, 15), (4, 15)],
+                }
+            ],
+        )
+
     def does_not_infinite_loop_on_recursive_fragments():
         assert_valid(
             """

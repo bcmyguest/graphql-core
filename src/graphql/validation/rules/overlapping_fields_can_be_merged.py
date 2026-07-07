@@ -105,6 +105,10 @@ ConflictReasonMessage: TypeAlias = str | list[ConflictReason]
 NodeAndDef: TypeAlias = tuple[GraphQLCompositeType, FieldNode, GraphQLField | None]
 # Dictionary of lists of those.
 NodeAndDefCollection: TypeAlias = dict[str, list[NodeAndDef]]
+# Tuple describing the structure of a field for deduplication.
+FieldFingerprint: TypeAlias = tuple[
+    int, str, int | None, tuple[tuple[str, str], ...], tuple[str, ...]
+]
 # A mapping of fragment variable names to their value nodes.
 VarMap: TypeAlias = "dict[str, ValueNode] | None"
 
@@ -539,8 +543,17 @@ def collect_conflicts_within(
         # (except to itself). If the list only has one item, nothing needs to be
         # compared.
         if len(fields) > 1:
-            for i, field in enumerate(fields):
-                for other_field in fields[i + 1 :]:
+            # Map the fields by their structural fingerprint. Structurally
+            # identical fields can never conflict, so a field whose fingerprint
+            # is already in the map is skipped with a single lookup instead of
+            # being compared against every other field. This avoids a quadratic
+            # blowup when a query repeats the same field many times.
+            unique_fields: dict[FieldFingerprint, NodeAndDef] = {}
+            for field in fields:
+                fingerprint = field_fingerprint(field)
+                if fingerprint in unique_fields:
+                    continue
+                for other_field in unique_fields.values():
                     conflict = find_conflict(
                         context,
                         cached_fields_and_fragment_spreads,
@@ -549,13 +562,33 @@ def collect_conflicts_within(
                         # within one collection is never mutually exclusive
                         False,
                         response_name,
-                        field,
-                        None,
                         other_field,
+                        None,
+                        field,
                         None,
                     )
                     if conflict:
                         conflicts.append(conflict)
+                unique_fields[fingerprint] = field
+
+
+def field_fingerprint(field: NodeAndDef) -> FieldFingerprint:
+    """Compute a fingerprint describing the structure of a field.
+
+    Fields with the same parent type, field name, arguments, directives and
+    selection set are structurally identical and can never conflict with each
+    other.
+    """
+    parent_type, node, _def = field
+    return (
+        id(parent_type),
+        node.name.value,
+        # distinct selection sets must still be compared for merging conflicts,
+        # so identity is used instead of a structural comparison
+        id(node.selection_set) if node.selection_set else None,
+        tuple((arg.name.value, print_ast(arg.value)) for arg in node.arguments or ()),
+        tuple(print_ast(directive) for directive in node.directives or ()),
+    )
 
 
 def collect_conflicts_between(
