@@ -1651,6 +1651,53 @@ def describe_validate_overlapping_fields_can_be_merged():
         assert errors
         assert "'name' and 'nickname' are different fields" in errors[0].message
 
+    @pytest.mark.timeout(5)
+    def many_conflicting_fields_do_not_cause_quadratic_blowup():
+        # Fields sharing a response name but with different arguments genuinely
+        # conflict, so they cannot be deduplicated. Without a comparison budget they
+        # would be compared in quadratic time (~65s for 3000 fields); the budget must
+        # bound the work and reject the query as too complex instead of hanging.
+        conflicting_fields = " ".join(f"loc: isAtLocation(x: {i})" for i in range(6000))
+        doc = parse(
+            f"""
+            fragment manyConflictingFields on Dog {{
+              {conflicting_fields}
+            }}
+            """
+        )
+        errors = validate(test_schema, doc, [OverlappingFieldsCanBeMergedRule])
+        assert len(errors) == 1
+        assert "too complex to validate" in errors[0].message
+
+    @pytest.mark.timeout(5)
+    def many_conflicting_nested_inline_fragments_do_not_cause_blowup():
+        # The inline-fragment variant: non-deduplicable leaves nested inside inline
+        # fragments still fan out to quadratic comparisons. The shared budget must
+        # bound this too, not just the flat case.
+        frags = " ".join(
+            "... on Dog { " * 10 + f"loc: isAtLocation(x: {i})" + " }" * 10
+            for i in range(2000)
+        )
+        doc = parse(f"fragment manyNestedConflicts on Dog {{ {frags} }}")
+        errors = validate(test_schema, doc, [OverlappingFieldsCanBeMergedRule])
+        assert len(errors) == 1
+        assert "too complex to validate" in errors[0].message
+
+    def conflicting_fields_below_budget_still_report_normally():
+        # A small number of conflicting fields stays under the comparison budget and
+        # must still surface the real conflict, not a spurious "too complex" error.
+        doc = parse(
+            """
+            fragment fewConflicts on Dog {
+              loc: isAtLocation(x: 0)
+              loc: isAtLocation(x: 1)
+            }
+            """
+        )
+        errors = validate(test_schema, doc, [OverlappingFieldsCanBeMergedRule])
+        assert errors
+        assert "they have differing arguments" in errors[0].message
+
     def finds_invalid_case_even_with_immediately_recursive_fragment():
         assert_errors(
             """
