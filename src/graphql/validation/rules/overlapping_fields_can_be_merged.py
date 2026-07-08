@@ -44,6 +44,18 @@ if TYPE_CHECKING:
 
 __all__ = ["OverlappingFieldsCanBeMergedRule"]
 
+# Maximum number of pairwise field comparisons before a query is rejected as too
+# complex to validate. Structurally identical fields are deduplicated before
+# comparison, but fields that differ (e.g. many identically aliased fields with
+# different arguments) cannot be deduplicated and would otherwise be compared in
+# quadratic time. This hard cap bounds that work regardless of query size.
+# Mirrors graphql-php's ``DEFAULT_MAX_COMPARISON_COUNT`` (GHSA-68jq-c3rv-pcrr).
+DEFAULT_MAX_FIELD_COMPARISONS = 100_000
+
+
+class TooManyFieldComparisonsError(Exception):
+    """Raised internally when the field comparison budget is exhausted."""
+
 
 def reason_message(reason: ConflictReasonMessage) -> str:
     if isinstance(reason, list):
@@ -63,12 +75,22 @@ class OverlappingFieldsCanBeMergedRule(ValidationRule):
     See https://spec.graphql.org/draft/#sec-Field-Selection-Merging
     """
 
+    #: Maximum number of pairwise field comparisons before the query is rejected
+    #: as too complex to validate. Subclass and override to tune this limit.
+    max_field_comparisons: int = DEFAULT_MAX_FIELD_COMPARISONS
+
     def __init__(self, context: ValidationContext) -> None:
         super().__init__(context)
         # A memoization for when fields and a fragment or two fragments are compared
         # "between" each other for conflicts. Comparisons may be made many times, so
         # memoizing this can dramatically improve the performance of this validator.
-        self.compared_fields_and_fragment_pairs = OrderedPairSet()
+        # It also caps the total number of pairwise field comparisons: fields that
+        # cannot be deduplicated (e.g. same response name, different arguments) would
+        # otherwise be compared in quadratic time, so once the cap is reached the
+        # query is reported as too complex instead of hanging.
+        self.compared_fields_and_fragment_pairs = OrderedPairSet(
+            self.max_field_comparisons
+        )
         self.compared_fragment_pairs = PairSet()
 
         # A cache for the "field map" and list of fragment spreads found in any given
@@ -76,15 +98,31 @@ class OverlappingFieldsCanBeMergedRule(ValidationRule):
         # times, so this improves the performance of this validator.
         self.cached_fields_and_fragment_spreads: dict = {}
 
+        # Set once the comparison budget is exhausted, so the "too complex" error is
+        # reported only once rather than for every remaining selection set.
+        self._reported_too_complex = False
+
     def enter_selection_set(self, selection_set: SelectionSetNode, *_args: Any) -> None:
-        conflicts = find_conflicts_within_selection_set(
-            self.context,
-            self.cached_fields_and_fragment_spreads,
-            self.compared_fields_and_fragment_pairs,
-            self.compared_fragment_pairs,
-            self.context.get_parent_type(),
-            selection_set,
-        )
+        if self._reported_too_complex:
+            return
+        try:
+            conflicts = find_conflicts_within_selection_set(
+                self.context,
+                self.cached_fields_and_fragment_spreads,
+                self.compared_fields_and_fragment_pairs,
+                self.compared_fragment_pairs,
+                self.context.get_parent_type(),
+                selection_set,
+            )
+        except TooManyFieldComparisonsError:
+            self._reported_too_complex = True
+            self.report_error(
+                GraphQLError(
+                    "Maximum number of field comparisons exceeded;"
+                    " the query is too complex to validate."
+                )
+            )
+            return
         for (reason_name, reason), fields1, fields2 in conflicts:
             reason_msg = reason_message(reason)
             self.report_error(
@@ -717,6 +755,12 @@ def find_conflict(
     Determines if there is a conflict between two particular fields, including comparing
     their sub-fields.
     """
+    # Count this comparison against the shared budget. Deduplication removes
+    # structurally identical fields, but conflicting fields (e.g. same response name,
+    # different arguments) still reach this point in quadratic numbers; exceeding the
+    # budget aborts validation before it becomes a denial-of-service.
+    compared_fields_and_fragment_pairs.count_comparison()
+
     parent_type1, node1, def1 = field1
     parent_type2, node2, def2 = field2
 
@@ -1070,14 +1114,26 @@ class OrderedPairSet:
 
     The first element is matched by object identity (its ``id``), since field maps
     are unhashable mappings that are kept alive for the duration of the validation.
+
+    Also tracks the running number of pairwise field comparisons and raises
+    :exc:`TooManyFieldComparisonsError` once ``comparison_limit`` is exceeded, so
+    that fields which cannot be deduplicated cannot drive quadratic-time validation.
     """
 
-    __slots__ = ("_data",)
+    __slots__ = ("_comparison_count", "_comparison_limit", "_data")
 
     _data: dict[int, dict[str, bool]]
 
-    def __init__(self) -> None:
+    def __init__(self, comparison_limit: int = DEFAULT_MAX_FIELD_COMPARISONS) -> None:
         self._data = {}
+        self._comparison_count = 0
+        self._comparison_limit = comparison_limit
+
+    def count_comparison(self) -> None:
+        """Record one pairwise comparison, raising when the budget is exhausted."""
+        self._comparison_count += 1
+        if self._comparison_count > self._comparison_limit:
+            raise TooManyFieldComparisonsError
 
     def has(self, a: NodeAndDefCollection, b: str, weakly_present: bool) -> bool:
         map_ = self._data.get(id(a))
