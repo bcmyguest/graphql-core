@@ -17,6 +17,7 @@ from ...language import (
     ListValueNode,
     ObjectFieldNode,
     ObjectValueNode,
+    SelectionNode,
     SelectionSetNode,
     ValueNode,
     VariableNode,
@@ -39,9 +40,21 @@ from ...utilities.sort_value_node import sort_value_node
 from . import ValidationContext, ValidationRule
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Hashable, Sequence
 
 __all__ = ["OverlappingFieldsCanBeMergedRule"]
+
+# Maximum number of pairwise field comparisons before a query is rejected as too
+# complex to validate. Structurally identical fields are deduplicated before
+# comparison, but fields that differ (e.g. many identically aliased fields with
+# different arguments) cannot be deduplicated and would otherwise be compared in
+# quadratic time. This hard cap bounds that work regardless of query size.
+# Mirrors graphql-php's ``DEFAULT_MAX_COMPARISON_COUNT`` (GHSA-68jq-c3rv-pcrr).
+DEFAULT_MAX_FIELD_COMPARISONS = 100_000
+
+
+class TooManyFieldComparisonsError(Exception):
+    """Raised internally when the field comparison budget is exhausted."""
 
 
 def reason_message(reason: ConflictReasonMessage) -> str:
@@ -62,12 +75,22 @@ class OverlappingFieldsCanBeMergedRule(ValidationRule):
     See https://spec.graphql.org/draft/#sec-Field-Selection-Merging
     """
 
+    #: Maximum number of pairwise field comparisons before the query is rejected
+    #: as too complex to validate. Subclass and override to tune this limit.
+    max_field_comparisons: int = DEFAULT_MAX_FIELD_COMPARISONS
+
     def __init__(self, context: ValidationContext) -> None:
         super().__init__(context)
         # A memoization for when fields and a fragment or two fragments are compared
         # "between" each other for conflicts. Comparisons may be made many times, so
         # memoizing this can dramatically improve the performance of this validator.
-        self.compared_fields_and_fragment_pairs = OrderedPairSet()
+        # It also caps the total number of pairwise field comparisons: fields that
+        # cannot be deduplicated (e.g. same response name, different arguments) would
+        # otherwise be compared in quadratic time, so once the cap is reached the
+        # query is reported as too complex instead of hanging.
+        self.compared_fields_and_fragment_pairs = OrderedPairSet(
+            self.max_field_comparisons
+        )
         self.compared_fragment_pairs = PairSet()
 
         # A cache for the "field map" and list of fragment spreads found in any given
@@ -75,15 +98,31 @@ class OverlappingFieldsCanBeMergedRule(ValidationRule):
         # times, so this improves the performance of this validator.
         self.cached_fields_and_fragment_spreads: dict = {}
 
+        # Set once the comparison budget is exhausted, so the "too complex" error is
+        # reported only once rather than for every remaining selection set.
+        self._reported_too_complex = False
+
     def enter_selection_set(self, selection_set: SelectionSetNode, *_args: Any) -> None:
-        conflicts = find_conflicts_within_selection_set(
-            self.context,
-            self.cached_fields_and_fragment_spreads,
-            self.compared_fields_and_fragment_pairs,
-            self.compared_fragment_pairs,
-            self.context.get_parent_type(),
-            selection_set,
-        )
+        if self._reported_too_complex:
+            return
+        try:
+            conflicts = find_conflicts_within_selection_set(
+                self.context,
+                self.cached_fields_and_fragment_spreads,
+                self.compared_fields_and_fragment_pairs,
+                self.compared_fragment_pairs,
+                self.context.get_parent_type(),
+                selection_set,
+            )
+        except TooManyFieldComparisonsError:
+            self._reported_too_complex = True
+            self.report_error(
+                GraphQLError(
+                    "Maximum number of field comparisons exceeded;"
+                    " the query is too complex to validate."
+                )
+            )
+            return
         for (reason_name, reason), fields1, fields2 in conflicts:
             reason_msg = reason_message(reason)
             self.report_error(
@@ -539,8 +578,11 @@ def collect_conflicts_within(
         # (except to itself). If the list only has one item, nothing needs to be
         # compared.
         if len(fields) > 1:
-            for i, field in enumerate(fields):
-                for other_field in fields[i + 1 :]:
+            # Deduplicate structurally identical fields to avoid quadratic blowup
+            # when a query repeats the same field many times.
+            unique_fields = deduplicate_fields(fields)
+            for i, field in enumerate(unique_fields):
+                for other_field in unique_fields[i + 1 :]:
                     conflict = find_conflict(
                         context,
                         cached_fields_and_fragment_spreads,
@@ -556,6 +598,99 @@ def collect_conflicts_within(
                     )
                     if conflict:
                         conflicts.append(conflict)
+
+
+def deduplicate_fields(fields: list[NodeAndDef]) -> list[NodeAndDef]:
+    """Deduplicate structurally equivalent fields.
+
+    Fields that are structurally equivalent (same parent type, field name, arguments,
+    directives and selection set, irrespective of the ordering of arguments,
+    directives or sibling selections) can never conflict with each other, so only one
+    of them needs to take part in the pairwise conflict comparison.
+    """
+    unique: list[NodeAndDef] = []
+    seen: set[tuple[Hashable, ...]] = set()
+    for field in fields:
+        key = field_fingerprint(field)
+        if key not in seen:
+            seen.add(key)
+            unique.append(field)
+    return unique
+
+
+def field_fingerprint(field: NodeAndDef) -> tuple[Hashable, ...]:
+    """Build a canonical key identifying a field's structure.
+
+    Fields with equal keys are structurally equivalent and cannot conflict, so only
+    one takes part in the pairwise comparison. The key is derived from AST content
+    (not node identity) and normalizes argument, directive and sibling-selection
+    ordering recursively, matching the equivalence used by ``find_conflict``, so
+    reordering those parts cannot defeat deduplication.
+    """
+    parent_type, node, _ = field
+    return (parent_type.name if parent_type else "", _canonical_field(node))
+
+
+def _canonical_field(node: FieldNode) -> tuple[Hashable, ...]:
+    return (
+        "field",
+        (node.alias or node.name).value,
+        node.name.value,
+        _canonical_arguments(node.arguments),
+        _canonical_directives(node.directives),
+        _canonical_selection_set(node.selection_set),
+    )
+
+
+def _canonical_selection(selection: SelectionNode) -> tuple[Hashable, ...]:
+    if isinstance(selection, FieldNode):
+        return _canonical_field(selection)
+    if isinstance(selection, FragmentSpreadNode):
+        return (
+            "spread",
+            selection.name.value,
+            _canonical_arguments(selection.arguments),
+            _canonical_directives(selection.directives),
+        )
+    if isinstance(selection, InlineFragmentNode):
+        return (
+            "inline",
+            selection.type_condition.name.value if selection.type_condition else "",
+            _canonical_directives(selection.directives),
+            _canonical_selection_set(selection.selection_set),
+        )
+    msg = f"Unexpected selection node: {type(selection).__name__}"  # pragma: no cover
+    raise TypeError(msg)  # pragma: no cover
+
+
+def _canonical_selection_set(
+    selection_set: SelectionSetNode | None,
+) -> tuple[Hashable, ...]:
+    if selection_set is None:
+        return ()
+    # Sorted so that reordering sibling selections does not change the result.
+    return tuple(sorted(map(_canonical_selection, selection_set.selections)))
+
+
+def _canonical_arguments(
+    arguments: Sequence[ArgumentNode | FragmentArgumentNode] | None,
+) -> tuple[tuple[str, str], ...]:
+    # Sorted by name with normalized values, matching ``same_arguments``.
+    return tuple(
+        (arg.name.value, stringify_value(arg.value))
+        for arg in sorted(arguments or (), key=lambda arg: arg.name.value)
+    )
+
+
+def _canonical_directives(
+    directives: Sequence[DirectiveNode] | None,
+) -> tuple[tuple[str, tuple[tuple[str, str], ...]], ...]:
+    return tuple(
+        sorted(
+            (directive.name.value, _canonical_arguments(directive.arguments))
+            for directive in directives or ()
+        )
+    )
 
 
 def collect_conflicts_between(
@@ -620,6 +755,12 @@ def find_conflict(
     Determines if there is a conflict between two particular fields, including comparing
     their sub-fields.
     """
+    # Count this comparison against the shared budget. Deduplication removes
+    # structurally identical fields, but conflicting fields (e.g. same response name,
+    # different arguments) still reach this point in quadratic numbers; exceeding the
+    # budget aborts validation before it becomes a denial-of-service.
+    compared_fields_and_fragment_pairs.count_comparison()
+
     parent_type1, node1, def1 = field1
     parent_type2, node2, def2 = field2
 
@@ -973,14 +1114,26 @@ class OrderedPairSet:
 
     The first element is matched by object identity (its ``id``), since field maps
     are unhashable mappings that are kept alive for the duration of the validation.
+
+    Also tracks the running number of pairwise field comparisons and raises
+    :exc:`TooManyFieldComparisonsError` once ``comparison_limit`` is exceeded, so
+    that fields which cannot be deduplicated cannot drive quadratic-time validation.
     """
 
-    __slots__ = ("_data",)
+    __slots__ = ("_comparison_count", "_comparison_limit", "_data")
 
     _data: dict[int, dict[str, bool]]
 
-    def __init__(self) -> None:
+    def __init__(self, comparison_limit: int = DEFAULT_MAX_FIELD_COMPARISONS) -> None:
         self._data = {}
+        self._comparison_count = 0
+        self._comparison_limit = comparison_limit
+
+    def count_comparison(self) -> None:
+        """Record one pairwise comparison, raising when the budget is exhausted."""
+        self._comparison_count += 1
+        if self._comparison_count > self._comparison_limit:
+            raise TooManyFieldComparisonsError
 
     def has(self, a: NodeAndDefCollection, b: str, weakly_present: bool) -> bool:
         map_ = self._data.get(id(a))
